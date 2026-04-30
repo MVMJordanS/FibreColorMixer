@@ -257,7 +257,7 @@ def visual_to_recipe_weights(visual_weights: np.ndarray, palette: Sequence[BaseC
     return raw_recipe / total
 
 
-def fit_palette_subset(target_rgb: RGB, palette: Sequence[BaseColor], influence: float = 0.35) -> Dict:
+def fit_palette_subset(target_rgb: RGB, palette: Sequence[BaseColor], influence: float = 0.35, thickness_target: float = None, thickness_tradeoff: float = None) -> Dict:
     visual_weights = solve_visual_mix_weights(target_rgb, palette)
     recipe_weights = visual_to_recipe_weights(visual_weights, palette, influence=influence)
 
@@ -272,7 +272,11 @@ def fit_palette_subset(target_rgb: RGB, palette: Sequence[BaseColor], influence:
 
     target_lab = rgb_to_lab(target_rgb)
     mixed_lab = rgb_to_lab(mixed_rgb)
-    error = delta_e_2000(target_lab, mixed_lab)
+    color_error = delta_e_2000(target_lab, mixed_lab)
+
+    deniers = np.array([c.denier for c in palette])
+    avg_denier = float((deniers * recipe_weights).sum())
+    denier_error = abs(avg_denier - thickness_target) if thickness_target is not None else 0.0
 
     rows = []
     for i, c in enumerate(palette):
@@ -287,7 +291,18 @@ def fit_palette_subset(target_rgb: RGB, palette: Sequence[BaseColor], influence:
         )
 
     rows.sort(key=lambda x: x["recipe_ratio"], reverse=True)
-    return {"mixed_rgb": mixed_rgb, "delta_e": error, "weights": rows}
+
+    # Compute combined score if tradeoff is provided
+    if thickness_tradeoff is not None and thickness_target is not None:
+        color_weight = (100 - thickness_tradeoff) / 100.0
+        thickness_weight = thickness_tradeoff / 100.0
+        # Normalize denier error to 0-1 range (assuming max error is 100)
+        denier_error_norm = min(denier_error / 100.0, 1.0)
+        score = color_error * color_weight + denier_error_norm * thickness_weight * color_error
+    else:
+        score = color_error
+
+    return {"mixed_rgb": mixed_rgb, "delta_e": color_error, "weights": rows, "avg_denier": avg_denier, "denier_error": denier_error, "score": score}
 
 
 def choose_best_fibers_greedily(
@@ -296,6 +311,8 @@ def choose_best_fibers_greedily(
     max_fibers_limit: int,
     min_improvement: float,
     influence: float = 0.35,
+    thickness_target: float = None,
+    thickness_tradeoff: float = None,
 ) -> Dict:
     if not palette:
         raise ValueError("Palette cannot be empty")
@@ -306,12 +323,12 @@ def choose_best_fibers_greedily(
     best_subset: List[BaseColor] = []
 
     for c in palette:
-        result = fit_palette_subset(target_rgb, [c], influence=influence)
-        if best_result is None or result["delta_e"] < best_result["delta_e"]:
+        result = fit_palette_subset(target_rgb, [c], influence=influence, thickness_target=thickness_target, thickness_tradeoff=thickness_tradeoff)
+        if best_result is None or result["score"] < best_result["score"]:
             best_result = result
             best_subset = [c]
 
-    current_error = best_result["delta_e"]
+    current_score = best_result["score"]
     remaining = [c for c in palette if c not in best_subset]
 
     while len(best_subset) < max_fibers_limit and remaining:
@@ -320,20 +337,20 @@ def choose_best_fibers_greedily(
 
         for candidate in remaining:
             subset = best_subset + [candidate]
-            result = fit_palette_subset(target_rgb, subset, influence=influence)
-            if candidate_best_result is None or result["delta_e"] < candidate_best_result["delta_e"]:
+            result = fit_palette_subset(target_rgb, subset, influence=influence, thickness_target=thickness_target, thickness_tradeoff=thickness_tradeoff)
+            if candidate_best_result is None or result["score"] < candidate_best_result["score"]:
                 candidate_best_result = result
                 candidate_best_subset = subset
 
         assert candidate_best_result is not None and candidate_best_subset is not None
-        improvement = current_error - candidate_best_result["delta_e"]
+        improvement = current_score - candidate_best_result["score"]
 
         if improvement < min_improvement:
             break
 
         best_subset = candidate_best_subset
         best_result = candidate_best_result
-        current_error = candidate_best_result["delta_e"]
+        current_score = candidate_best_result["score"]
         remaining = [c for c in palette if c not in best_subset]
 
     return {
@@ -342,6 +359,7 @@ def choose_best_fibers_greedily(
         "delta_e": round(best_result["delta_e"], 4),
         "fibers_used": len(best_subset),
         "weights": best_result["weights"],
+        "avg_denier": best_result["avg_denier"],
     }
 
 
@@ -351,12 +369,9 @@ def choose_best_fibers_beam_search(
     max_fibers_limit: int,
     beam_width: int = 5,
     influence: float = 0.35,
+    thickness_target: float = None,
+    thickness_tradeoff: float = None,
 ) -> Dict:
-    """Search small multi-fiber combinations directly.
-
-    This is much better than a greedy start for colors that are naturally
-    created by mixing two or three fibers, such as purples and teals.
-    """
     if not palette:
         raise ValueError("Palette cannot be empty")
 
@@ -365,13 +380,13 @@ def choose_best_fibers_beam_search(
 
     current_level = []
     for c in palette:
-        result = fit_palette_subset(target_rgb, [c], influence=influence)
-        current_level.append((result["delta_e"], [c], result))
+        result = fit_palette_subset(target_rgb, [c], influence=influence, thickness_target=thickness_target, thickness_tradeoff=thickness_tradeoff)
+        current_level.append((result["score"], [c], result))
 
     current_level.sort(key=lambda item: item[0])
     beam = current_level[:beam_width]
 
-    best_delta = beam[0][0]
+    best_score = beam[0][0]
     best_result = beam[0][2]
     best_subset = beam[0][1]
 
@@ -388,8 +403,8 @@ def choose_best_fibers_beam_search(
                     continue
                 seen.add(key)
 
-                result = fit_palette_subset(target_rgb, new_subset, influence=influence)
-                next_level.append((result["delta_e"], new_subset, result))
+                result = fit_palette_subset(target_rgb, new_subset, influence=influence, thickness_target=thickness_target, thickness_tradeoff=thickness_tradeoff)
+                next_level.append((result["score"], new_subset, result))
 
         if not next_level:
             break
@@ -397,8 +412,8 @@ def choose_best_fibers_beam_search(
         next_level.sort(key=lambda item: item[0])
         beam = next_level[:beam_width]
 
-        if beam[0][0] < best_delta:
-            best_delta = beam[0][0]
+        if beam[0][0] < best_score:
+            best_score = beam[0][0]
             best_subset = beam[0][1]
             best_result = beam[0][2]
 
@@ -408,6 +423,7 @@ def choose_best_fibers_beam_search(
         "delta_e": round(best_result["delta_e"], 4),
         "fibers_used": len(best_subset),
         "weights": best_result["weights"],
+        "avg_denier": best_result["avg_denier"],
     }
 
 
@@ -542,6 +558,10 @@ def main() -> None:
         min_improvement = st.number_input("Minimum Delta E improvement to add a fiber", min_value=0.0, value=0.75, step=0.05)
         influence = st.slider("Denier influence", 0.0, 1.0, 0.35, 0.01)
 
+        # New sliders: thickness target and tradeoff between thickness and color accuracy
+        thickness_target = st.slider("Thickness target", 1, 100, 25)
+        thickness_tradeoff = st.slider("Color vs Thickness Accuracy Tradeoff", 0, 100, 25)
+
         st.divider()
         st.subheader("Needle punch notes")
         st.write(
@@ -599,6 +619,41 @@ def main() -> None:
 
     run = st.button("Solve blend", type="primary", use_container_width=True)
 
+    def adjust_weights_for_thickness(weights, thickness_target, tradeoff):
+        # tradeoff: 0 = only color, 100 = only thickness
+        tradeoff = np.clip(tradeoff, 0, 100)
+        color_weight = (100 - tradeoff) / 100.0
+        thickness_weight = tradeoff / 100.0
+        # Get current average denier
+        deniers = np.array([w["denier"] for w in weights])
+        ratios = np.array([w["recipe_ratio"] for w in weights])
+        ratios = ratios / ratios.sum() if ratios.sum() > 0 else ratios
+        avg_denier = (deniers * ratios).sum()
+        # Compute adjustment factor for each fiber
+        target = float(thickness_target)
+        # The adjustment is a soft blend between original and target
+        adjusted_ratios = []
+        for w in weights:
+            d = w["denier"]
+            orig = w["recipe_ratio"]
+            # The closer d is to target, the higher the boost
+            denier_score = max(0.0, 1.0 - abs(d - target) / 100.0)
+            # Blend color and thickness priorities
+            adj = orig * color_weight + denier_score * thickness_weight * orig
+            adjusted_ratios.append(adj)
+        # Normalize
+        total = sum(adjusted_ratios)
+        if total > 0:
+            adjusted_ratios = [x / total for x in adjusted_ratios]
+        else:
+            adjusted_ratios = ratios
+        # Update weights
+        for i, w in enumerate(weights):
+            w["recipe_ratio"] = adjusted_ratios[i]
+        # New average denier
+        new_avg_denier = float(np.dot([w["denier"] for w in weights], adjusted_ratios))
+        return weights, new_avg_denier
+
     if run:
         try:
             if search_mode.startswith("Beam"):
@@ -608,6 +663,8 @@ def main() -> None:
                     max_fibers_limit=max_fibers_limit,
                     beam_width=beam_width,
                     influence=influence,
+                    thickness_target=thickness_target,
+                    thickness_tradeoff=thickness_tradeoff,
                 )
             else:
                 result = choose_best_fibers_greedily(
@@ -616,11 +673,17 @@ def main() -> None:
                     max_fibers_limit=max_fibers_limit,
                     min_improvement=min_improvement,
                     influence=influence,
+                    thickness_target=thickness_target,
+                    thickness_tradeoff=thickness_tradeoff,
                 )
 
             mixed_rgb = result["mixed_rgb"]
             delta_e = result["delta_e"]
             weights = result["weights"]
+            avg_denier = result.get("avg_denier", None)
+
+            # Adjust weights for thickness target/tradeoff (optional, can be removed if not needed)
+            # weights, avg_denier = adjust_weights_for_thickness(weights, thickness_target, thickness_tradeoff)
 
             top_left, top_right = st.columns(2)
             with top_left:
@@ -628,10 +691,11 @@ def main() -> None:
             with top_right:
                 st.markdown(swatch_html("Mixed result", mixed_rgb), unsafe_allow_html=True)
 
-            metrics = st.columns(3)
+            metrics = st.columns(4)
             metrics[0].metric("Fibers used", result["fibers_used"])
             metrics[1].metric("Delta E", f"{delta_e:.4f}")
             metrics[2].metric("Target hex", rgb_to_hex(target_rgb))
+            metrics[3].metric("Avg Denier", f"{avg_denier:.2f}" if avg_denier is not None else "-")
 
             st.subheader("Selected recipe")
             recipe_df = pd.DataFrame(weights)
