@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from io import BytesIO
-from math import atan2, cos, degrees, exp, radians, sin, sqrt, log1p
-from typing import Dict, List, Sequence, Tuple
+from math import atan2, cos, degrees, exp, radians, sin, sqrt
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
 
 RGB = Tuple[int, int, int]
@@ -20,10 +19,13 @@ class BaseColor:
     denier: float
 
 
+# Functional starter palette so the app runs immediately
 DEFAULT_PALETTE: List[BaseColor] = [
 ]
 
 BICO_MIN_SHARE = 0.08
+MIN_ACTIVE_RATIO = 0.01
+
 
 def is_bico(color: BaseColor) -> bool:
     return "bico" in color.name.lower()
@@ -52,7 +54,6 @@ def enforce_min_share(weights: np.ndarray, index: int, minimum: float) -> np.nda
         out[index] = 1.0
         return out
 
-    # Keep the chosen Bico color at `minimum`, scale everyone else down proportionally.
     scale = (1.0 - minimum) / other_sum
     for i in range(len(w)):
         if i != index:
@@ -63,7 +64,7 @@ def enforce_min_share(weights: np.ndarray, index: int, minimum: float) -> np.nda
 
 
 # -----------------------------
-# Color conversion and parsing
+# Color conversion
 # -----------------------------
 
 def hex_to_rgb(value: str) -> RGB:
@@ -246,13 +247,6 @@ def project_to_simplex(v: np.ndarray) -> np.ndarray:
     return w / s
 
 
-def denier_strength(denier: float, max_denier: float, influence: float = 0.35) -> float:
-    if max_denier <= 0:
-        return 1.0
-    normalized = log1p(denier) / log1p(max_denier)
-    return 1.0 + (normalized * influence)
-
-
 def solve_visual_mix_weights(
     target_rgb: RGB,
     palette: Sequence[BaseColor],
@@ -281,41 +275,96 @@ def solve_visual_mix_weights(
     return w
 
 
-def visual_to_recipe_weights(visual_weights: np.ndarray, palette: Sequence[BaseColor], influence: float = 0.35) -> np.ndarray:
-    max_denier = max(c.denier for c in palette)
-    strengths = np.array([denier_strength(c.denier, max_denier=max_denier, influence=influence) for c in palette], dtype=float)
-
-    raw_recipe = visual_weights / strengths
-    raw_recipe = np.maximum(raw_recipe, 0.0)
-
-    total = raw_recipe.sum()
-    if total <= 0:
-        return np.ones_like(raw_recipe) / len(raw_recipe)
-
-    return raw_recipe / total
+def normalize_weights(weights: np.ndarray) -> np.ndarray:
+    w = np.maximum(np.array(weights, dtype=float, copy=True), 0.0)
+    s = float(w.sum())
+    if s <= 0:
+        return np.ones_like(w) / len(w)
+    return w / s
 
 
+def denier_optical_strength(denier: float, max_denier: float, influence: float = 0.35) -> float:
+    """
+    Lower denier => thicker fiber => more visual impact.
+    Higher denier => thinner fiber => less visual impact.
+
+    Returns a multiplier where the highest-denier fiber is about 1.0 and
+    lower-denier fibers are > 1.0.
+    """
+    denier = max(float(denier), 1e-9)
+    max_denier = max(float(max_denier), 1e-9)
+    if max_denier <= 0:
+        return 1.0
+    if denier >= max_denier:
+        return 1.0
+    return (max_denier / denier) ** float(influence)
+
+
+def thickness_penalty(avg_denier: float, thickness_target: Optional[float]) -> float:
+    if thickness_target is None:
+        return 0.0
+    denom = max(float(thickness_target), 1.0)
+    return abs(avg_denier - float(thickness_target)) / denom
+
+
+def lab_hue_degrees(rgb: RGB) -> float:
+    _, a, b = rgb_to_lab(rgb)
+    if a == 0 and b == 0:
+        return 0.0
+    return degrees(atan2(b, a)) % 360.0
+
+
+def hue_conflict_penalty(weights: np.ndarray, palette: Sequence[BaseColor]) -> float:
+    """
+    Penalize opposite / complementary hue pairings so the solver avoids
+    unnecessary cancellation when a more natural blend exists.
+    """
+    w = normalize_weights(weights)
+    hues = np.array([lab_hue_degrees(c.rgb) for c in palette], dtype=float)
+
+    penalty = 0.0
+    for i in range(len(palette)):
+        for j in range(i + 1, len(palette)):
+            wi = float(w[i])
+            wj = float(w[j])
+            if wi <= 0 or wj <= 0:
+                continue
+
+            delta = abs(hues[i] - hues[j])
+            delta = min(delta, 360.0 - delta)
+
+            # 0 when similar, 1 when directly opposite
+            opposition = max(0.0, -cos(radians(delta)))
+            penalty += opposition * wi * wj
+
+    return float(penalty)
 
 
 def fit_palette_subset(
     target_rgb: RGB,
     palette: Sequence[BaseColor],
     influence: float = 0.35,
-    thickness_target: float = None,
-    thickness_tradeoff: float = None,
+    thickness_target: Optional[float] = None,
+    thickness_tradeoff: Optional[float] = None,
+    optimization_style: str = "Pure color match",
     bico_min_share: float = BICO_MIN_SHARE,
 ) -> Dict:
-    visual_weights = solve_visual_mix_weights(target_rgb, palette)
-    base_recipe_weights = visual_to_recipe_weights(visual_weights, palette, influence=influence)
+    if not palette:
+        raise ValueError("Palette cannot be empty")
 
+    # Start from a color fit
+    visual_weights = solve_visual_mix_weights(target_rgb, palette)
+    recipe_weights = normalize_weights(visual_weights)
+
+    # Denier should affect what the blend looks like
     max_denier = max(c.denier for c in palette)
     strengths = np.array(
-        [denier_strength(c.denier, max_denier=max_denier, influence=influence) for c in palette],
+        [denier_optical_strength(c.denier, max_denier=max_denier, influence=influence) for c in palette],
         dtype=float,
     )
 
-    X = np.column_stack([rgb_to_linear_rgb(c.rgb) for c in palette])
     target_lab = rgb_to_lab(target_rgb)
+    X = np.column_stack([rgb_to_linear_rgb(c.rgb) for c in palette])
 
     bico_indices = [i for i, c in enumerate(palette) if is_bico(c)]
     candidate_indices = bico_indices if bico_indices else [None]
@@ -323,31 +372,36 @@ def fit_palette_subset(
     best = None
 
     for forced_bico_idx in candidate_indices:
-        recipe_weights = base_recipe_weights.copy()
+        candidate_recipe = recipe_weights.copy()
 
         if forced_bico_idx is not None:
-            recipe_weights = enforce_min_share(recipe_weights, forced_bico_idx, bico_min_share)
+            candidate_recipe = enforce_min_share(candidate_recipe, forced_bico_idx, bico_min_share)
 
-        effective = recipe_weights * strengths
-        effective = effective / effective.sum()
+        candidate_recipe = normalize_weights(candidate_recipe)
 
-        mixed_linear = X @ effective
+        optical_weights = candidate_recipe * strengths
+        optical_weights = normalize_weights(optical_weights)
+
+        mixed_linear = X @ optical_weights
         mixed_rgb = linear_rgb_to_rgb(mixed_linear)
 
         mixed_lab = rgb_to_lab(mixed_rgb)
         color_error = delta_e_2000(target_lab, mixed_lab)
 
-        deniers = np.array([c.denier for c in palette])
-        avg_denier = float((deniers * recipe_weights).sum())
-        denier_error = abs(avg_denier - thickness_target) if thickness_target is not None else 0.0
+        deniers = np.array([c.denier for c in palette], dtype=float)
+        avg_denier = float(np.dot(deniers, candidate_recipe))
+        denier_error = thickness_penalty(avg_denier, thickness_target)
 
         if thickness_tradeoff is not None and thickness_target is not None:
-            color_weight = (100 - thickness_tradeoff) / 100.0
-            thickness_weight = thickness_tradeoff / 100.0
-            denier_error_norm = min(denier_error / 100.0, 1.0)
-            score = color_error * color_weight + denier_error_norm * thickness_weight * color_error
+            trade = float(np.clip(thickness_tradeoff, 0, 100))
+            color_weight = (100.0 - trade) / 100.0
+            thickness_weight = trade / 100.0
+            score = (color_weight * color_error) + (thickness_weight * denier_error)
         else:
             score = color_error
+
+        if optimization_style == "Natural fiber blending":
+            score += 8.0 * hue_conflict_penalty(optical_weights, palette)
 
         rows = []
         for i, c in enumerate(palette):
@@ -357,7 +411,8 @@ def fit_palette_subset(
                     "rgb": c.rgb,
                     "denier": c.denier,
                     "visual_weight": float(visual_weights[i]),
-                    "recipe_ratio": float(recipe_weights[i]),
+                    "recipe_ratio": float(candidate_recipe[i]),
+                    "optical_weight": float(optical_weights[i]),
                 }
             )
 
@@ -365,11 +420,11 @@ def fit_palette_subset(
 
         candidate = {
             "mixed_rgb": mixed_rgb,
-            "delta_e": color_error,
+            "delta_e": float(color_error),
             "weights": rows,
             "avg_denier": avg_denier,
-            "denier_error": denier_error,
-            "score": score,
+            "denier_error": float(denier_error),
+            "score": float(score),
         }
 
         if best is None or candidate["score"] < best["score"]:
@@ -378,18 +433,15 @@ def fit_palette_subset(
     return best
 
 
-
-
-
-
 def choose_best_fibers_greedily(
     target_rgb: RGB,
     palette: List[BaseColor],
     max_fibers_limit: int,
     min_improvement: float,
     influence: float = 0.35,
-    thickness_target: float = None,
-    thickness_tradeoff: float = None,
+    thickness_target: Optional[float] = None,
+    thickness_tradeoff: Optional[float] = None,
+    optimization_style: str = "Pure color match",
 ) -> Dict:
     if not palette:
         raise ValueError("Palette cannot be empty")
@@ -409,6 +461,7 @@ def choose_best_fibers_greedily(
             influence=influence,
             thickness_target=thickness_target,
             thickness_tradeoff=thickness_tradeoff,
+            optimization_style=optimization_style,
         )
         if best_result is None or result["score"] < best_result["score"]:
             best_result = result
@@ -434,6 +487,7 @@ def choose_best_fibers_greedily(
                 influence=influence,
                 thickness_target=thickness_target,
                 thickness_tradeoff=thickness_tradeoff,
+                optimization_style=optimization_style,
             )
             if candidate_best_result is None or result["score"] < candidate_best_result["score"]:
                 candidate_best_result = result
@@ -451,19 +505,16 @@ def choose_best_fibers_greedily(
         current_score = candidate_best_result["score"]
         remaining = [c for c in palette if c not in best_subset]
 
+    active_count = sum(w["recipe_ratio"] >= MIN_ACTIVE_RATIO for w in best_result["weights"])
+
     return {
         "target_rgb": target_rgb,
         "mixed_rgb": best_result["mixed_rgb"],
         "delta_e": round(best_result["delta_e"], 4),
-        "fibers_used": len(best_subset),
+        "fibers_used": active_count,
         "weights": best_result["weights"],
         "avg_denier": best_result["avg_denier"],
     }
-
-
-
-
-
 
 
 def choose_best_fibers_beam_search(
@@ -472,8 +523,9 @@ def choose_best_fibers_beam_search(
     max_fibers_limit: int,
     beam_width: int = 5,
     influence: float = 0.35,
-    thickness_target: float = None,
-    thickness_tradeoff: float = None,
+    thickness_target: Optional[float] = None,
+    thickness_tradeoff: Optional[float] = None,
+    optimization_style: str = "Pure color match",
 ) -> Dict:
     if not palette:
         raise ValueError("Palette cannot be empty")
@@ -492,6 +544,7 @@ def choose_best_fibers_beam_search(
             influence=influence,
             thickness_target=thickness_target,
             thickness_tradeoff=thickness_tradeoff,
+            optimization_style=optimization_style,
         )
         current_level.append((result["score"], [c], result))
 
@@ -525,6 +578,7 @@ def choose_best_fibers_beam_search(
                     influence=influence,
                     thickness_target=thickness_target,
                     thickness_tradeoff=thickness_tradeoff,
+                    optimization_style=optimization_style,
                 )
                 next_level.append((result["score"], new_subset, result))
 
@@ -539,17 +593,16 @@ def choose_best_fibers_beam_search(
             best_subset = beam[0][1]
             best_result = beam[0][2]
 
+    active_count = sum(w["recipe_ratio"] >= MIN_ACTIVE_RATIO for w in best_result["weights"])
+
     return {
         "target_rgb": target_rgb,
         "mixed_rgb": best_result["mixed_rgb"],
         "delta_e": round(best_result["delta_e"], 4),
-        "fibers_used": len(best_subset),
+        "fibers_used": active_count,
         "weights": best_result["weights"],
         "avg_denier": best_result["avg_denier"],
     }
-
-
-
 
 
 # -----------------------------
@@ -617,7 +670,6 @@ def df_to_palette(df: pd.DataFrame) -> List[BaseColor]:
 
 
 def load_palette_file(uploaded_file) -> pd.DataFrame:
-    """Load a palette from CSV or Excel into the canonical column layout."""
     filename = uploaded_file.name.lower()
 
     if filename.endswith(".csv"):
@@ -653,7 +705,7 @@ def load_palette_file(uploaded_file) -> pd.DataFrame:
     for c in ["r", "g", "b"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
     df["denier"] = pd.to_numeric(df["denier"], errors="coerce").fillna(0).astype(float)
-    df = df[(df["name"] != "") & df["denier"] > 0]
+    df = df[(df["name"] != "") & (df["denier"] > 0)]
     df = df[(df[["r", "g", "b"]] >= 0).all(axis=1) & (df[["r", "g", "b"]] <= 255).all(axis=1)]
     return df.reset_index(drop=True)
 
@@ -679,19 +731,28 @@ def main() -> None:
             ["Greedy", "Beam search (better for mixed colors)"],
             index=1,
         )
+        optimization_style = st.selectbox(
+            "Optimization style",
+            ["Pure color match", "Natural fiber blending"],
+            index=1,
+        )
         beam_width = st.slider("Beam width", 2, 10, 5)
-        min_improvement = st.number_input("Minimum Delta E improvement to add a fiber", min_value=0.0, value=0.75, step=0.05)
-        influence = st.slider("Denier influence", 0.0, 1.0, 0.35, 0.01)
+        min_improvement = st.number_input(
+            "Minimum Delta E improvement to add a fiber",
+            min_value=0.0,
+            value=0.75,
+            step=0.05,
+        )
 
-        # New sliders: thickness target and tradeoff between thickness and color accuracy
-        thickness_target = st.slider("Thickness target", 1, 100, 25)
-        thickness_tradeoff = st.slider("Color vs Thickness Accuracy Tradeoff", 0, 100, 25)
+        influence = st.slider("Denier influence", 0.0, 1.0, 0.35, 0.01)
+        thickness_target = st.slider("Target denier", 1.0, 100.0, 25.0, 1.0)
+        thickness_tradeoff = st.slider("Color vs denier tradeoff", 0, 100, 25)
 
         st.divider()
         st.subheader("Needle punch notes")
         st.write(
-            "This app keeps the current palette/denier logic and makes it interactive. "
-            "You can later add stock limits, locked fibers, or lots/batches for true plant-side use."
+            "Lower denier is treated as thicker and more visually dominant. "
+            "The color mix is calculated with denier-weighted optical contributions."
         )
 
     st.subheader("Palette")
@@ -721,7 +782,7 @@ def main() -> None:
             "r": st.column_config.NumberColumn("R", min_value=0, max_value=255, step=1),
             "g": st.column_config.NumberColumn("G", min_value=0, max_value=255, step=1),
             "b": st.column_config.NumberColumn("B", min_value=0, max_value=255, step=1),
-            "denier": st.column_config.NumberColumn("Denier", min_value=0.0, step=1.0),
+            "denier": st.column_config.NumberColumn("Denier", min_value=0.0, step=0.5),
         },
         key="palette_editor",
     )
@@ -744,41 +805,6 @@ def main() -> None:
 
     run = st.button("Solve blend", type="primary", use_container_width=True)
 
-    def adjust_weights_for_thickness(weights, thickness_target, tradeoff):
-        # tradeoff: 0 = only color, 100 = only thickness
-        tradeoff = np.clip(tradeoff, 0, 100)
-        color_weight = (100 - tradeoff) / 100.0
-        thickness_weight = tradeoff / 100.0
-        # Get current average denier
-        deniers = np.array([w["denier"] for w in weights])
-        ratios = np.array([w["recipe_ratio"] for w in weights])
-        ratios = ratios / ratios.sum() if ratios.sum() > 0 else ratios
-        avg_denier = (deniers * ratios).sum()
-        # Compute adjustment factor for each fiber
-        target = float(thickness_target)
-        # The adjustment is a soft blend between original and target
-        adjusted_ratios = []
-        for w in weights:
-            d = w["denier"]
-            orig = w["recipe_ratio"]
-            # The closer d is to target, the higher the boost
-            denier_score = max(0.0, 1.0 - abs(d - target) / 100.0)
-            # Blend color and thickness priorities
-            adj = orig * color_weight + denier_score * thickness_weight * orig
-            adjusted_ratios.append(adj)
-        # Normalize
-        total = sum(adjusted_ratios)
-        if total > 0:
-            adjusted_ratios = [x / total for x in adjusted_ratios]
-        else:
-            adjusted_ratios = ratios
-        # Update weights
-        for i, w in enumerate(weights):
-            w["recipe_ratio"] = adjusted_ratios[i]
-        # New average denier
-        new_avg_denier = float(np.dot([w["denier"] for w in weights], adjusted_ratios))
-        return weights, new_avg_denier
-
     if run:
         try:
             if search_mode.startswith("Beam"):
@@ -790,6 +816,7 @@ def main() -> None:
                     influence=influence,
                     thickness_target=thickness_target,
                     thickness_tradeoff=thickness_tradeoff,
+                    optimization_style=optimization_style,
                 )
             else:
                 result = choose_best_fibers_greedily(
@@ -800,15 +827,13 @@ def main() -> None:
                     influence=influence,
                     thickness_target=thickness_target,
                     thickness_tradeoff=thickness_tradeoff,
+                    optimization_style=optimization_style,
                 )
 
             mixed_rgb = result["mixed_rgb"]
             delta_e = result["delta_e"]
             weights = result["weights"]
             avg_denier = result.get("avg_denier", None)
-
-            # Adjust weights for thickness target/tradeoff (optional, can be removed if not needed)
-            # weights, avg_denier = adjust_weights_for_thickness(weights, thickness_target, thickness_tradeoff)
 
             top_left, top_right = st.columns(2)
             with top_left:
@@ -820,18 +845,21 @@ def main() -> None:
             metrics[0].metric("Fibers used", result["fibers_used"])
             metrics[1].metric("Delta E", f"{delta_e:.4f}")
             metrics[2].metric("Target hex", rgb_to_hex(target_rgb))
-            metrics[3].metric("Avg Denier", f"{avg_denier:.2f}" if avg_denier is not None else "-")
+            metrics[3].metric("Avg denier", f"{avg_denier:.2f}" if avg_denier is not None else "-")
 
             st.subheader("Selected recipe")
             recipe_df = pd.DataFrame(weights)
-            recipe_df = recipe_df[["name", "rgb", "denier", "visual_weight", "recipe_ratio"]]
+            recipe_df = recipe_df[["name", "rgb", "denier", "visual_weight", "recipe_ratio", "optical_weight"]]
             recipe_df["visual_weight"] = recipe_df["visual_weight"].map(lambda x: f"{x:.4f}")
             recipe_df["recipe_ratio"] = recipe_df["recipe_ratio"].map(lambda x: f"{x:.4f}")
-            st.dataframe(recipe_df[recipe_df["recipe_ratio"] != "0.0000"], use_container_width=True, hide_index=True)
+            recipe_df["optical_weight"] = recipe_df["optical_weight"].map(lambda x: f"{x:.4f}")
 
-            st.subheader("All fitted weights")
+            active_recipe_df = recipe_df[pd.to_numeric(recipe_df["recipe_ratio"], errors="coerce") >= MIN_ACTIVE_RATIO]
+            st.dataframe(active_recipe_df, use_container_width=True, hide_index=True)
+
+            st.subheader("Optical color contribution distribution")
             chart_df = pd.DataFrame(weights)
-            chart_df = chart_df[chart_df["recipe_ratio"] > 0].sort_values("recipe_ratio", ascending=False)
+            chart_df = chart_df[chart_df["optical_weight"] > 0].sort_values("optical_weight", ascending=False)
 
             if not chart_df.empty:
                 pie_colors = [
@@ -841,13 +869,13 @@ def main() -> None:
 
                 fig, ax = plt.subplots(figsize=(8, 8))
                 wedges, texts, autotexts = ax.pie(
-                    chart_df["recipe_ratio"],
+                    chart_df["optical_weight"],
                     colors=pie_colors,
                     autopct="%1.1f%%",
                     startangle=90,
                     wedgeprops={"edgecolor": "white", "linewidth": 1},
                 )
-                ax.set_title("Recipe Ratio Distribution")
+                ax.set_title("Optical Weight Distribution")
                 ax.axis("equal")
 
                 ax.legend(
@@ -860,7 +888,7 @@ def main() -> None:
 
                 st.pyplot(fig)
             else:
-                st.info("No positive recipe ratios to display.")
+                st.info("No positive optical weights to display.")
 
         except Exception as e:
             st.error(f"Error: {e}")
