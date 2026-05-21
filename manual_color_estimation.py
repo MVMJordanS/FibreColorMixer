@@ -18,6 +18,7 @@ class FiberRow:
     rgb: RGB
     denier: float
     ratio: float
+    fleck_factor: float = 1.0
 
 
 # -----------------------------
@@ -209,9 +210,7 @@ def swatch_html(label: str, rgb: RGB, text_color: str = "#111111") -> str:
 def default_manual_df() -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"name": "Fiber A", "r": 165, "g": 120, "b": 80, "denier": 20.0, "ratio": 50.0},
-            {"name": "Fiber B", "r": 220, "g": 200, "b": 180, "denier": 15.0, "ratio": 30.0},
-            {"name": "Fiber C", "r": 90, "g": 70, "b": 50, "denier": 30.0, "ratio": 20.0},
+
         ]
     )
 
@@ -222,17 +221,55 @@ def normalize_manual_df(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(missing)}")
 
-    out = df[required].copy()
+    out = df.copy()
+    if "fleck_factor" not in out.columns:
+        out["fleck_factor"] = 1.0
+
+    rename_map = {}
+    for col in out.columns:
+        c = str(col).strip().lower()
+        if c in {"name", "fiber", "color", "colour", "shade"}:
+            rename_map[col] = "name"
+        elif c in {"r", "red"}:
+            rename_map[col] = "r"
+        elif c in {"g", "green"}:
+            rename_map[col] = "g"
+        elif c in {"b", "blue"}:
+            rename_map[col] = "b"
+        elif c in {"denier", "d", "weight"}:
+            rename_map[col] = "denier"
+        elif c in {"ratio", "parts", "percent", "%"}:
+            rename_map[col] = "ratio"
+        elif c in {"fleck", "fleck_factor", "visual_factor", "factor"}:
+            rename_map[col] = "fleck_factor"
+
+    out = out.rename(columns=rename_map)
+    if "fleck_factor" not in out.columns:
+        out["fleck_factor"] = 1.0
+
+    out = out[["name", "r", "g", "b", "denier", "ratio", "fleck_factor"]].copy()
     out["name"] = out["name"].astype(str).str.strip()
     out["r"] = pd.to_numeric(out["r"], errors="coerce").fillna(0).astype(int)
     out["g"] = pd.to_numeric(out["g"], errors="coerce").fillna(0).astype(int)
     out["b"] = pd.to_numeric(out["b"], errors="coerce").fillna(0).astype(int)
     out["denier"] = pd.to_numeric(out["denier"], errors="coerce").fillna(0).astype(float)
     out["ratio"] = pd.to_numeric(out["ratio"], errors="coerce").fillna(0).astype(float)
+    out["fleck_factor"] = pd.to_numeric(out["fleck_factor"], errors="coerce").fillna(1).astype(float)
 
     out = out[(out["name"] != "") & (out["denier"] > 0) & (out["ratio"] >= 0)]
     out = out[(out[["r", "g", "b"]] >= 0).all(axis=1) & (out[["r", "g", "b"]] <= 255).all(axis=1)]
+    out = out[out["fleck_factor"] > 0]
     return out.reset_index(drop=True)
+
+
+def fiber_count_factor(denier: float) -> float:
+    """Lower denier = thicker fiber = more visual influence.
+
+    This mirrors the production workbook more closely than the earlier
+    max-denier/exponent heuristic.
+    """
+    denier = max(float(denier), 1e-9)
+    return 1.0 / denier
 
 
 def estimate_manual_blend(df: pd.DataFrame, reference_rgb: RGB | None = None) -> dict:
@@ -244,15 +281,27 @@ def estimate_manual_blend(df: pd.DataFrame, reference_rgb: RGB | None = None) ->
     if total <= 0:
         raise ValueError("At least one ratio must be greater than zero")
 
-    weights = ratios / total
+    base_weights = ratios / total
+    deniers = df["denier"].to_numpy(dtype=float)
+    fleck_factors = df["fleck_factor"].to_numpy(dtype=float)
+
+    count_factors = np.array([fiber_count_factor(d) for d in deniers], dtype=float)
+    visibility = count_factors * fleck_factors
+    effective_weights = base_weights * visibility
+    effective_total = float(effective_weights.sum())
+    if effective_total <= 0:
+        effective_weights = base_weights
+    else:
+        effective_weights = effective_weights / effective_total
+
     rgb_matrix = np.array(
         [rgb_to_linear_rgb((int(r), int(g), int(b))) for r, g, b in df[["r", "g", "b"]].to_numpy()]
     )
-    mixed_linear = weights @ rgb_matrix
+    mixed_linear = effective_weights @ rgb_matrix
     mixed_rgb = linear_rgb_to_rgb(mixed_linear)
 
-    deniers = df["denier"].to_numpy(dtype=float)
-    avg_denier = float(np.dot(deniers, weights))
+    avg_denier = float(np.dot(deniers, base_weights))
+    weighted_denier_for_mix = float(np.dot(deniers, effective_weights))
 
     target_delta_e = None
     if reference_rgb is not None:
@@ -265,15 +314,20 @@ def estimate_manual_blend(df: pd.DataFrame, reference_rgb: RGB | None = None) ->
                 "name": row["name"],
                 "rgb": (int(row["r"]), int(row["g"]), int(row["b"])),
                 "denier": float(row["denier"]),
-                "ratio": float(weights[i]),
-                "ratio_percent": float(weights[i] * 100.0),
+                "fleck_factor": float(row["fleck_factor"]),
+                "ratio": float(base_weights[i]),
+                "ratio_percent": float(base_weights[i] * 100.0),
+                "fiber_count_factor": float(count_factors[i]),
+                "visibility": float(visibility[i]),
+                "effective_weight": float(effective_weights[i]),
             }
         )
 
-    rows.sort(key=lambda x: x["ratio"], reverse=True)
+    rows.sort(key=lambda x: x["effective_weight"], reverse=True)
     return {
         "mixed_rgb": mixed_rgb,
         "avg_denier": avg_denier,
+        "weighted_denier_for_mix": weighted_denier_for_mix,
         "delta_e": target_delta_e,
         "weights": rows,
     }
@@ -295,7 +349,7 @@ def main() -> None:
         reference_color = st.color_picker("Reference color", "#A56C3D", disabled=not use_reference)
         st.divider()
         st.write(
-            "This page estimates the output from a user-entered recipe. It does not search for an optimal blend."
+            "This page estimates the output from a user-entered recipe. It uses inverse denier plus an optional fleck factor, matching the workbook logic more closely."
         )
 
     if "manual_df" not in st.session_state:
@@ -307,7 +361,7 @@ def main() -> None:
     uploaded = st.file_uploader(
         "Optional: upload CSV to replace the current table",
         type=["csv"],
-        help="Expected columns: name, r, g, b, denier, ratio",
+        help="Expected columns: name, r, g, b, denier, ratio, fleck_factor. fleck_factor is optional and defaults to 1.",
     )
 
     if uploaded is not None:
@@ -329,9 +383,70 @@ def main() -> None:
             "b": st.column_config.NumberColumn("B", min_value=0, max_value=255, step=1),
             "denier": st.column_config.NumberColumn("Denier", min_value=0.0, step=0.5),
             "ratio": st.column_config.NumberColumn("Ratio / Parts", min_value=0.0, step=1.0),
+            "fleck_factor": st.column_config.NumberColumn("Fleck Factor", min_value=0.0, step=0.05),
         },
         key="manual_color_editor",
     )
+
+    # --- Optional palette loader for convenience ---
+    st.subheader("Fiber palette (optional)")
+    if "fiber_palette" not in st.session_state:
+        st.session_state.fiber_palette = None
+
+    palette_upload = st.file_uploader(
+        "Upload fiber palette CSV (columns: name, r, g, b, denier[, fleck_factor])",
+        type=["csv"],
+        key="palette_upload",
+        help="This palette is used for the dropdown below.",
+    )
+
+    palette_df = None
+    if palette_upload is not None:
+        try:
+            palette_df = pd.read_csv(palette_upload)
+            required_cols = {"name", "r", "g", "b", "denier"}
+            if not required_cols.issubset(set(palette_df.columns)):
+                raise ValueError(f"Missing columns: {required_cols - set(palette_df.columns)}")
+            if "fleck_factor" not in palette_df.columns:
+                palette_df["fleck_factor"] = 1.0
+            palette_df = palette_df.drop_duplicates(subset=["name"])
+            st.session_state.fiber_palette = palette_df
+            st.success(f"Loaded {len(palette_df)} fibers from palette.")
+        except Exception as e:
+            st.session_state.fiber_palette = None
+            st.error(f"Could not load palette: {e}")
+    elif st.session_state.fiber_palette is not None:
+        palette_df = st.session_state.fiber_palette
+
+    if palette_df is not None and not palette_df.empty:
+        with st.form("add_fiber_form", clear_on_submit=True):
+            fiber_names = palette_df["name"].astype(str).tolist()
+            selected_name = st.selectbox("Add fiber from palette", fiber_names, key="palette_fiber_name")
+            selected_row = palette_df[palette_df["name"] == selected_name].iloc[0]
+            r = int(selected_row["r"])
+            g = int(selected_row["g"])
+            b = int(selected_row["b"])
+            denier = float(selected_row["denier"])
+            fleck_factor = float(selected_row["fleck_factor"]) if "fleck_factor" in selected_row else 1.0
+            ratio = st.number_input("Ratio / Parts", min_value=0.0, step=1.0, value=10.0, key="palette_ratio")
+            st.write(f"RGB: {r}, {g}, {b} | Denier: {denier} | Fleck Factor: {fleck_factor}")
+            add_fiber = st.form_submit_button("Add fiber to table")
+            if add_fiber:
+                new_row = {
+                    "name": selected_name,
+                    "r": r,
+                    "g": g,
+                    "b": b,
+                    "denier": denier,
+                    "ratio": ratio,
+                    "fleck_factor": fleck_factor,
+                }
+                st.session_state.manual_df = pd.concat(
+                    [st.session_state.manual_df, pd.DataFrame([new_row])],
+                    ignore_index=True,
+                )
+                st.success(f"Added {selected_name} to table.")
+                st.rerun()
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -351,7 +466,7 @@ def main() -> None:
     try:
         preview_df = normalize_manual_df(edited_df)
     except Exception:
-        preview_df = pd.DataFrame(columns=["name", "r", "g", "b", "denier", "ratio"])
+        preview_df = pd.DataFrame(columns=["name", "r", "g", "b", "denier", "ratio", "fleck_factor"])
 
     if not preview_df.empty:
         total_ratio = float(preview_df["ratio"].sum())
@@ -372,35 +487,49 @@ def main() -> None:
                 else:
                     st.info("Reference comparison is disabled.")
 
-            metrics = st.columns(4)
+            metrics = st.columns(5)
             metrics[0].metric("Fibers used", len(df))
             metrics[1].metric("Estimated hex", rgb_to_hex(result["mixed_rgb"]))
             metrics[2].metric("Avg denier", f"{result['avg_denier']:.2f}")
-            metrics[3].metric(
+            metrics[3].metric("Mix denier", f"{result['weighted_denier_for_mix']:.2f}")
+            metrics[4].metric(
                 "Delta E vs reference",
                 f"{result['delta_e']:.4f}" if result["delta_e"] is not None else "-",
             )
 
             st.subheader("Recipe breakdown")
             recipe_df = pd.DataFrame(result["weights"])
-            recipe_df = recipe_df[["name", "rgb", "denier", "ratio_percent"]].copy()
+            recipe_df = recipe_df[[
+                "name",
+                "rgb",
+                "denier",
+                "fleck_factor",
+                "ratio_percent",
+                "fiber_count_factor",
+                "visibility",
+                "effective_weight",
+            ]].copy()
             recipe_df["ratio_percent"] = recipe_df["ratio_percent"].map(lambda x: f"{x:.2f}%")
+            recipe_df["fleck_factor"] = recipe_df["fleck_factor"].map(lambda x: f"{x:.2f}")
+            recipe_df["fiber_count_factor"] = recipe_df["fiber_count_factor"].map(lambda x: f"{x:.4f}")
+            recipe_df["visibility"] = recipe_df["visibility"].map(lambda x: f"{x:.4f}")
+            recipe_df["effective_weight"] = recipe_df["effective_weight"].map(lambda x: f"{x:.4f}")
             st.dataframe(recipe_df, use_container_width=True, hide_index=True)
 
             chart_df = pd.DataFrame(result["weights"])
-            chart_df = chart_df[chart_df["ratio"] > 0].sort_values("ratio", ascending=False)
+            chart_df = chart_df[chart_df["effective_weight"] > 0].sort_values("effective_weight", ascending=False)
 
             if not chart_df.empty:
                 fig, ax = plt.subplots(figsize=(8, 8))
                 pie_colors = [(r / 255.0, g / 255.0, b / 255.0) for (r, g, b) in chart_df["rgb"]]
                 wedges, texts, autotexts = ax.pie(
-                    chart_df["ratio_percent"],
+                    chart_df["effective_weight"],
                     colors=pie_colors,
                     autopct="%1.1f%%",
                     startangle=90,
                     wedgeprops={"edgecolor": "white", "linewidth": 1},
                 )
-                ax.set_title("Input Ratio Distribution")
+                ax.set_title("Visibility-Adjusted Recipe Distribution")
                 ax.axis("equal")
                 ax.legend(
                     wedges,
@@ -411,12 +540,13 @@ def main() -> None:
                 )
                 st.pyplot(fig)
             else:
-                st.info("No positive ratios were available for plotting.")
+                st.info("No positive weights were available for plotting.")
 
             st.subheader("Exportable summary")
             summary_lines = [
                 f"Estimated output: {rgb_to_hex(result['mixed_rgb'])} / RGB {result['mixed_rgb']}",
                 f"Average denier: {result['avg_denier']:.2f}",
+                f"Mix denier: {result['weighted_denier_for_mix']:.2f}",
             ]
             if result["delta_e"] is not None:
                 summary_lines.append(f"Delta E vs reference: {result['delta_e']:.4f}")
@@ -433,6 +563,7 @@ def main() -> None:
                 "g": result["mixed_rgb"][1],
                 "b": result["mixed_rgb"][2],
                 "avg_denier": round(result["avg_denier"], 2),
+                "mix_denier": round(result["weighted_denier_for_mix"], 2),
                 "delta_e": round(result["delta_e"], 4) if result["delta_e"] is not None else None,
                 "fiber_count": int(len(df)),
                 "fiber_names": ", ".join(df["name"].astype(str).tolist()),
@@ -452,6 +583,7 @@ def main() -> None:
                     "g",
                     "b",
                     "avg_denier",
+                    "mix_denier",
                     "delta_e",
                     "fiber_count",
                     "fiber_names",
