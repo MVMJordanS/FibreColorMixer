@@ -14,8 +14,14 @@ finder_page = st.Page(
     icon="🔎",
 )
 
+customer_mixing_page = st.Page(
+    "customer_mixing.py",
+    title="Customer Mixing",
+    icon="🧵",
+)
+
 page = st.navigation(
-    [manual_page, finder_page],
+    [manual_page, finder_page, customer_mixing_page],
     position="sidebar",   # or "top"
 )
 
