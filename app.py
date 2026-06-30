@@ -20,8 +20,14 @@ customer_mixing_page = st.Page(
     icon="🧵",
 )
 
+color_extraction_page = st.Page(
+    "ColorExtraction.py",
+    title="Color Extraction",
+    icon="📷",
+)
+
 page = st.navigation(
-    [manual_page, finder_page, customer_mixing_page],
+    [manual_page, finder_page, customer_mixing_page, color_extraction_page],
     position="sidebar",   # or "top"
 )
 
